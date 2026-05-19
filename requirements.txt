@@ -1,0 +1,16 @@
+# Core (required)
+fastapi==0.111.0
+uvicorn==0.29.0
+python-multipart==0.0.9
+librosa==0.10.1
+soundfile==0.12.1
+scipy==1.13.0
+numpy==1.26.4
+scikit-learn==1.4.2
+noisereduce==3.0.2
+
+# Deep Learning (optional — for CNN, YAMNet, PAN models)
+# Run this to install:
+#   pip install tensorflow tensorflow-hub
+# tensorflow==2.16.1
+# tensorflow-hub==0.16.1

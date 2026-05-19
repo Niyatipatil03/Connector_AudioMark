@@ -1859,40 +1859,133 @@ async def import_from_path(request: Request):
         return {"imported": [f"Folder not found: {raw_path}"],
                 "message": f"Folder not found: {raw_path}", "total": 0}
 
+    AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+    def _find_child(parent: Path, names):
+        """Case-insensitive child folder lookup."""
+        if not parent.exists() or not parent.is_dir(): return None
+        wanted = {n.lower() for n in names}
+        for c in parent.iterdir():
+            if c.is_dir() and c.name.lower() in wanted:
+                return c
+        return None
+
+    def _list_audio(folder: Path):
+        if not folder or not folder.exists(): return []
+        return [f for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() in AUDIO_EXTS]
+
+    def _list_json(folder: Path):
+        if not folder or not folder.exists(): return []
+        return [f for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() == ".json"]
+
+    def _looks_like_project(d: Path):
+        """A folder is a project if it has uploads/audio AND/OR annotations.
+        Returns (uploads_dir, annotations_dir, flat_files) where any can be None."""
+        if not d.is_dir(): return None
+        upl = _find_child(d, ["uploads", "audio", "wav", "wavs"])
+        ann = _find_child(d, ["annotations", "annotation", "anns", "labels"])
+        # Flat layout: audio + json files directly inside the folder
+        flat_audio = _list_audio(d)
+        flat_json  = _list_json(d)
+        if upl or ann: return (upl, ann, None)
+        if flat_audio and (flat_json or True):
+            # Accept flat folder as a project if it has audio
+            return (None, None, (flat_audio, flat_json))
+        return None
+
+    def _materialise_project(proj_name: str, info, src_dir: Path):
+        """Create a project in PROJECTS_ROOT from detected pieces."""
+        dest = PROJECTS_ROOT / proj_name
+        if dest.exists():
+            return f"{proj_name} (already exists)"
+        try:
+            (dest / "uploads").mkdir(parents=True)
+            (dest / "annotations").mkdir(parents=True)
+            (dest / "models").mkdir(parents=True)
+            upl, ann, flat = info
+            if upl:
+                for f in _list_audio(upl):
+                    _sh.copy2(str(f), str(dest/"uploads"/f.name))
+            if ann:
+                for f in _list_json(ann):
+                    _sh.copy2(str(f), str(dest/"annotations"/f.name))
+            if flat:
+                audio_files, json_files = flat
+                for f in audio_files:
+                    _sh.copy2(str(f), str(dest/"uploads"/f.name))
+                for f in json_files:
+                    _sh.copy2(str(f), str(dest/"annotations"/f.name))
+            return proj_name
+        except Exception as e:
+            return f"{proj_name} (error: {e})"
+
     imported = []
 
-    # Strategy 1: AudioMark project folder
+    # Strategy 1: AudioMark project folder — look for projects under common roots.
+    # A "project" is any subfolder containing uploads/ or annotations/ (any case).
     for proj_root in [src/"data"/"projects", src/"projects", src]:
         if not (proj_root.exists() and proj_root.is_dir()): continue
-        found = [x for x in proj_root.iterdir()
-                 if x.is_dir() and (x/"annotations").exists()]
-        if not found: continue
-        for proj in found:
-            dest = PROJECTS_ROOT / proj.name
-            if dest.exists():
-                imported.append(f"{proj.name} (already exists)")
+        found = []
+        for x in sorted(proj_root.iterdir()):
+            if not x.is_dir(): continue
+            # Skip non-project siblings at the data/ level
+            if x.name.lower() in {"uploads", "annotations", "annotation",
+                                  "models", "audio", "wavs"}:
                 continue
-            try: _sh.copytree(str(proj), str(dest)); imported.append(proj.name)
-            except Exception as e: imported.append(f"{proj.name} (error: {e})")
+            info = _looks_like_project(x)
+            if info: found.append((x, info))
+        if not found: continue
+        for proj, info in found:
+            imported.append(_materialise_project(proj.name, info, proj))
         if imported:
             msg = f"Imported {len(imported)} project(s)"
             return {"imported": imported, "message": msg, "total": len(imported)}
 
-    # Strategy 2: Audio files folder
-    EXTS = {".wav", ".flac", ".WAV", ".FLAC", ".mp3"}
+    # Strategy 2: Legacy single-project layout — uploads/ and annotation(s)/
+    # are siblings (e.g. data/uploads + data/Annotation), no per-project folders.
+    for root in [src/"data", src]:
+        if not (root.exists() and root.is_dir()): continue
+        upl = _find_child(root, ["uploads", "audio", "wav", "wavs"])
+        ann = _find_child(root, ["annotations", "annotation", "anns", "labels"])
+        if not upl and not ann: continue
+        if not _list_audio(upl) and not _list_json(ann): continue
+        # Name the imported project after the source folder
+        base_name = src.name or "imported"
+        proj_name = base_name
+        n = 2
+        while (PROJECTS_ROOT / proj_name).exists():
+            proj_name = f"{base_name}_{n}"; n += 1
+        result = _materialise_project(proj_name, (upl, ann, None), root)
+        imported.append(result)
+        msg = f"Imported legacy layout as project '{proj_name}'"
+        return {"imported": imported, "message": msg, "total": 1}
+
+    # Strategy 3: Audio files folder — copy all audio (recursively) into
+    # the currently active project, matching annotations by stem if any exist.
     files = []
-    for ext in EXTS:
-        files.extend(src.rglob(f"*{ext}"))
+    for af in src.rglob("*"):
+        if af.is_file() and af.suffix.lower() in AUDIO_EXTS:
+            files.append(af)
     files = sorted(set(files))
 
     if not files:
         return {"imported": [f"No audio files found in: {src.name}"],
-                "message": f"No audio files found in: {src.name}", "total": 0}
+                "message": f"No audio files or projects found in: {src.name}",
+                "total": 0}
+
+    # Collect every JSON file under src so we can match annotations by stem
+    json_map = {}
+    for jf in src.rglob("*.json"):
+        if jf.is_file():
+            json_map.setdefault(jf.stem, jf)
 
     active  = get_active_project()
     upl_dir = project_path(active) / "uploads"
-    upl_dir.mkdir(parents=True, exist_ok=True)
     ann_dir = project_path(active) / "annotations"
+    upl_dir.mkdir(parents=True, exist_ok=True)
+    ann_dir.mkdir(parents=True, exist_ok=True)
 
     copied = skipped = matched = 0
     for af in files:
@@ -1901,7 +1994,14 @@ async def import_from_path(request: Request):
         else:
             try: _sh.copy2(str(af), str(dest)); copied += 1
             except: skipped += 1
-        if (ann_dir / (af.stem + ".json")).exists(): matched += 1
+        jf = json_map.get(af.stem)
+        if jf:
+            jdest = ann_dir / (af.stem + ".json")
+            if not jdest.exists():
+                try: _sh.copy2(str(jf), str(jdest)); matched += 1
+                except: pass
+            else:
+                matched += 1
 
     parts = []
     if copied:  parts.append(f"Loaded {copied} file(s) from {src.name}")

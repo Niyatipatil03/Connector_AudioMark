@@ -2,7 +2,7 @@
 AudioMark Annotator — Pure annotation pipeline with audio effects
 FastAPI backend
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -1820,99 +1820,104 @@ async def detect_connectors(file: UploadFile = File(...), n_connectors: int = 3)
 
 
 @app.post("/api/projects/import_path")
-async def import_from_path(request: Request):
-    """Import audio files or projects from any folder path."""
-    import shutil as _sh, json as _json
+def import_from_path(payload: dict):
+    """
+    Import projects OR audio files into AudioMark.
+    Supports:
+      - AudioMark folder (has data/projects/) → copies projects
+      - Audio files folder (has WAV/FLAC files) → copies audio + matches annotations
+    """
+    import shutil as _shutil
 
-    # Read JSON body - works with ALL FastAPI versions
-    raw_path = ""
-    try:
-        body = await request.body()
-        if body:
-            try:
-                data = _json.loads(body)
-                raw_path = str(data.get("path", "")).strip()
-            except:
-                raw_path = body.decode("utf-8", errors="ignore").strip()
-    except:
-        pass
+    raw = payload.get("path", "").strip().strip('"').strip("'")
+    if not raw:
+        raise HTTPException(400, "Please enter a folder path.")
 
-    # Clean the path
-    raw_path = raw_path.strip('"').strip("'").strip()
-
-    if not raw_path:
-        return {"imported": ["No path provided"],
-                "message": "Please enter a folder path", "total": 0}
-
-    # Find the folder
-    src = None
-    for candidate in [raw_path,
-                      raw_path.replace("\\", "/"),
-                      raw_path.replace("/", "\\")]:
+    src_path = None
+    for candidate in [raw, raw.replace("\\", "/"), raw.replace("/", "\\")]:
         try:
             p = Path(candidate).expanduser()
             if p.exists() and p.is_dir():
-                src = p; break
+                src_path = p
+                break
         except: pass
 
-    if not src:
-        return {"imported": [f"Folder not found: {raw_path}"],
-                "message": f"Folder not found: {raw_path}", "total": 0}
+    if not src_path:
+        raise HTTPException(400,
+            f"Folder not found: {raw}\n"
+            "Check the path is correct. Example: D:\\Connector Noise\\Audio_XUV")
 
     imported = []
 
-    # Strategy 1: AudioMark project folder
-    for proj_root in [src/"data"/"projects", src/"projects", src]:
-        if not (proj_root.exists() and proj_root.is_dir()): continue
-        found = [x for x in proj_root.iterdir()
-                 if x.is_dir() and (x/"annotations").exists()]
-        if not found: continue
-        for proj in found:
+    # ── Strategy 1: AudioMark project folder ─────────────
+    candidates = [
+        src_path / "data" / "projects",
+        src_path / "projects",
+        src_path,
+    ]
+    src_projects = next(
+        (p for p in candidates if p.exists() and p.is_dir()
+         and any(x.is_dir() and (x/"annotations").exists() for x in p.iterdir()
+                 if x.is_dir())),
+        None
+    )
+    if src_projects:
+        for proj in src_projects.iterdir():
+            if not proj.is_dir(): continue
             dest = PROJECTS_ROOT / proj.name
             if dest.exists():
-                imported.append(f"{proj.name} (already exists)")
+                imported.append(f"{proj.name} (already exists — skipped)")
                 continue
-            try: _sh.copytree(str(proj), str(dest)); imported.append(proj.name)
-            except Exception as e: imported.append(f"{proj.name} (error: {e})")
+            _shutil.copytree(str(proj), str(dest))
+            imported.append(proj.name)
+        src_active = src_path / "data" / ".active_project"
+        if src_active.exists() and not ACTIVE_FILE.exists():
+            _shutil.copy(str(src_active), str(ACTIVE_FILE))
         if imported:
-            msg = f"Imported {len(imported)} project(s)"
-            return {"imported": imported, "message": msg, "total": len(imported)}
+            return {"imported": imported, "total": len(imported),
+                    "message": f"Imported {len(imported)} project(s): " + ", ".join(imported)}
 
-    # Strategy 2: Audio files folder
-    EXTS = {".wav", ".flac", ".WAV", ".FLAC", ".mp3"}
-    files = []
-    for ext in EXTS:
-        files.extend(src.rglob(f"*{ext}"))
-    files = sorted(set(files))
+    # ── Strategy 2: Audio files folder ───────────────────
+    AUDIO_EXTS = {'.wav', '.flac', '.mp3', '.WAV', '.FLAC'}
+    audio_files = []
+    for ext in AUDIO_EXTS:
+        audio_files.extend(src_path.rglob(f'*{ext}'))
+    audio_files = sorted(set(audio_files))
 
-    if not files:
-        return {"imported": [f"No audio files found in: {src.name}"],
-                "message": f"No audio files found in: {src.name}", "total": 0}
+    if not audio_files:
+        raise HTTPException(400,
+            f"No audio files or project data found in:\n{src_path}\n\n"
+            "Expected WAV/FLAC audio files OR an AudioMark installation folder.")
 
     active  = get_active_project()
     upl_dir = project_path(active) / "uploads"
-    upl_dir.mkdir(parents=True, exist_ok=True)
     ann_dir = project_path(active) / "annotations"
+    upl_dir.mkdir(parents=True, exist_ok=True)
 
-    copied = skipped = matched = 0
-    for af in files:
+    copied = []; skipped = []; matched = []
+    for af in audio_files:
         dest = upl_dir / af.name
-        if dest.exists(): skipped += 1
+        if dest.exists():
+            skipped.append(af.name)
         else:
-            try: _sh.copy2(str(af), str(dest)); copied += 1
-            except: skipped += 1
-        if (ann_dir / (af.stem + ".json")).exists(): matched += 1
+            try:
+                _shutil.copy2(str(af), str(dest))
+                copied.append(af.name)
+            except Exception as e:
+                skipped.append(f"{af.name} (error: {e})")
+        if (ann_dir / (af.stem + ".json")).exists():
+            matched.append(af.name)
 
-    parts = []
-    if copied:  parts.append(f"Loaded {copied} file(s) from {src.name}")
-    if matched: parts.append(f"Found {matched} annotation(s)")
-    if skipped: parts.append(f"Skipped {skipped} (already exist)")
-    if not parts: parts.append("No new files found")
+    msg_parts = []
+    if copied:   msg_parts.append(f"Loaded {len(copied)} audio file(s) from {src_path.name}")
+    if matched:  msg_parts.append(f"Found {len(matched)} matching annotation(s)")
+    if skipped:  msg_parts.append(f"Skipped {len(skipped)} (already exist)")
+    if not msg_parts: msg_parts.append("No new files found")
 
-    msg = " | ".join(parts)
-    return {"imported": parts, "message": msg,
-            "copied": copied, "matched": matched, "total": len(files)}
-
+    imported = msg_parts
+    return {"imported": imported, "total": len(imported),
+            "copied": len(copied), "matched": len(matched),
+            "message": "\n".join(msg_parts)}
 
 
 

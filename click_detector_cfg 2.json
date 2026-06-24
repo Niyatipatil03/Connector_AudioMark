@@ -1,0 +1,20 @@
+{
+  "sr": 44100,
+  "hp_cutoff_hz": 300,
+  "dsp_gate": false,
+  "hf_weight": 2.0,
+  "n_fft": 1024,
+  "hop": 220,
+  "n_mels": 128,
+  "fmax": 22050,
+  "use_pcen": true,
+  "noise_reduce": 0.0,
+  "target_sigma_ms": 10.0,
+  "crop_sec": 4.0,
+  "min_gap_ms": 150.0,
+  "ignore_start_ms": 0.0,
+  "event_tol_ms": 50.0,
+  "peak_thresh": 0.5,
+  "pos_weight": 30.0,
+  "n_classes": 1
+}
